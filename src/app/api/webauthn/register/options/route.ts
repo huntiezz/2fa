@@ -1,0 +1,90 @@
+import {
+	generateRegistrationOptions,
+	type AuthenticatorTransportFuture,
+} from "@simplewebauthn/server";
+import { isoUint8Array } from "@simplewebauthn/server/helpers";
+import type { NextRequest } from "next/server";
+import { writeAuditLog } from "@/lib/mfa/audit";
+import { getExpectedOrigins, getMfaEnv } from "@/lib/mfa/env";
+import { getRequestIp, jsonError, jsonOk } from "@/lib/mfa/http";
+import { requireSessionUser } from "@/lib/mfa/route-session";
+import { cleanupChallenges, insertWebAuthnChallenge } from "@/lib/mfa/webauthn-challenges";
+
+export const runtime = "nodejs";
+
+export async function POST(request: NextRequest) {
+	let env;
+	try {
+		env = getMfaEnv();
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : "Configuration error";
+		return jsonError(msg, 500);
+	}
+
+	const auth = await requireSessionUser();
+	if (auth.errorResponse) return auth.errorResponse;
+	const { supabase, user } = auth;
+
+	await cleanupChallenges(supabase);
+
+	const { data: existingCreds, error: credErr } = await supabase
+		.from("webauthn_credentials")
+		.select("credential_id, transports")
+		.eq("user_id", user.id);
+	if (credErr) return jsonError(credErr.message, 500);
+
+	const { data: profile } = await supabase
+		.from("profiles")
+		.select("username")
+		.eq("id", user.id)
+		.maybeSingle();
+
+	const userName = profile?.username ?? user.email?.split("@")[0] ?? "user";
+
+	const excludeCredentials =
+		existingCreds?.map((c) => ({
+			id: c.credential_id as string,
+			type: "public-key" as const,
+			transports: Array.isArray(c.transports)
+				? (c.transports as AuthenticatorTransportFuture[])
+				: undefined,
+		})) ?? [];
+
+	const options = await generateRegistrationOptions({
+		rpName: "2FA Demo",
+		rpID: env.rpId,
+		userName,
+		userDisplayName: userName,
+		userID: isoUint8Array.fromUTF8String(user.id),
+		attestationType: "none",
+		authenticatorSelection: {
+			residentKey: "preferred",
+			userVerification: "required",
+		},
+		excludeCredentials,
+		timeout: Math.min(env.challengeTtlMs, 120_000),
+	});
+
+	const expiresAt = new Date(Date.now() + env.challengeTtlMs).toISOString();
+	await insertWebAuthnChallenge(supabase, {
+		userId: user.id,
+		challenge: options.challenge,
+		challengeType: "registration",
+		expiresAtIso: expiresAt,
+	});
+
+	await writeAuditLog(supabase, {
+		userId: user.id,
+		action: "webauthn_register_options",
+		metadata: { excludeCount: excludeCredentials.length },
+		ipAddress: getRequestIp(request),
+		userAgent: request.headers.get("user-agent"),
+	});
+
+	return jsonOk({
+		options,
+		rpId: env.rpId,
+		origins: getExpectedOrigins(),
+		expiresAt,
+	});
+}

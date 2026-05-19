@@ -1,0 +1,2 @@
+-- Superseded by 003_fix_signup_triggers.sql (run that file instead).
+-- This version used confirmed_at and could break signup.
